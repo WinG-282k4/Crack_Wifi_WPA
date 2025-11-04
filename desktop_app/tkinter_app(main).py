@@ -525,106 +525,173 @@ class DesktopApp(tk.Tk):
         t.start()
 
     def _capture(self, index):
+        import signal
+
         self.capture_btn.config(state=tk.DISABLED)
         self.log("Starting handshake capture...")
 
-        # Lấy thông tin từ listbox
+        # Lấy thông tin từ listbox (đã có CH hiển thị trong entry)
         try:
             entry = self.net_listbox.get(index)
         except Exception:
-            entry = "<unknown> | 00:00:00:00:00:00 | -"
-    
+            entry = "<unknown>  |  00:00:00:00:00:00  |  CH:?  |  -"
+
         parts = [p.strip() for p in entry.split("|")]
         ssid = parts[0] if len(parts) > 0 else "<hidden>"
-        bssid = parts[1] if len(parts) > 1 else None
-    
+        bssid = None
+        channel = None
+
+        # cố gắng parse BSSID và CH từ string hiển thị
+        for p in parts:
+            m = re.search(r"([0-9A-Fa-f:]{17})", p)
+            if m and not bssid:
+                bssid = m.group(1)
+            mch = re.search(r"CH[:\s]*([0-9]+)", p, re.I)
+            if mch and not channel:
+                channel = mch.group(1)
+
         if not bssid:
             self.log("Cannot determine BSSID from selection")
             self.capture_btn.config(state=tk.NORMAL)
             return
-    
-        # TODO: Lấy channel từ scan nếu bạn có map BSSID->channel
-        ch = None
-        for p in parts:
-            if p.strip().upper().startswith("CH:"):
-                ch = p.strip().split(":", 1)[1]
-                break
-        channel = ch if ch else "6"
-    
-        # File save dialog
-        default_name = f"handshake_{ssid}.cap"
-        path = filedialog.asksaveasfilename(
-            title="Save handshake as",
-            defaultextension=".cap",
-            initialfile=default_name,
-            filetypes=[("Capture files", "*.cap"), ("All files", "*.*")]
-        )
-        if not path:
-            self.log("Handshake capture cancelled by user")
-            self.capture_btn.config(state=tk.NORMAL)
-            return
-    
-        # Xác định interface monitor
+
+        if not channel:
+            channel = "6"  # fallback
+
         iface = self.iface_var.get().strip()
         if not iface:
             self.log("No interface selected")
             self.capture_btn.config(state=tk.NORMAL)
             return
-    
-        # Thử chuyển sang monitor mode
+
+        # Ensure monitor mode is enabled (we won't assume name changes)
         try:
-            self.log(f"Enabling monitor mode on {iface}...")
-            subprocess.run(["sudo", "airmon-ng", "start", iface], check=True)
-            #Thêm "mon" nếu cần
-            monitor_iface = iface
-            self.log(f"Monitor interface: {monitor_iface}")
+            self.log(f"Enabling monitor mode on {iface} (if needed)...")
+            subprocess.run(["sudo", "airmon-ng", "start", iface], check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         except Exception as e:
-            self.log(f"Failed to enable monitor mode: {e}")
+            self.log(f"airmon-ng start warning: {e}")
+
+        # Determine which interface to use: prefer iface+'mon' if exists, else iface itself
+        monitor_iface = iface
+        try:
+            iwcfg = subprocess.check_output(["iwconfig"], text=True, stderr=subprocess.DEVNULL)
+            # if iface+'mon' present in iwconfig output, use it
+            if (iface + "mon") in iwcfg:
+                monitor_iface = iface + "mon"
+        except Exception:
+            pass
+
+        self.log(f"Monitor interface: {monitor_iface}")
+
+        # Ask user for base path (airodump will append -01.cap)
+        default_name = f"handshake_{ssid.replace(' ', '_')}"
+        path_base = filedialog.asksaveasfilename(
+            title="Save handshake as (base name; airodump will append -01.cap)",
+            defaultextension=".cap",
+            initialfile=default_name,
+            filetypes=[("Capture files", "*.cap"), ("All files", "*.*")]
+        )
+        if not path_base:
+            self.log("Handshake capture cancelled by user")
             self.capture_btn.config(state=tk.NORMAL)
             return
-    
-        # Chạy airodump-ng
-        cmd = ["sudo", "airodump-ng", "--bssid", bssid, "-c", channel, "-w", path, monitor_iface]
+
+        cmd = ["sudo", "airodump-ng", "--bssid", bssid, "-c", str(channel), "-w", path_base, monitor_iface]
         self.log(f"Running: {' '.join(cmd)}")
-    
+
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    
-            def stream(pipe, name):
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+        except Exception as e:
+            self.log(f"Failed to start airodump-ng: {e}")
+            self.capture_btn.config(state=tk.NORMAL)
+            return
+
+        handshake_found = False
+        start_time = time.time()
+        timeout = 180  # seconds, tăng nếu cần
+
+        def stream_reader(pipe, name):
+            nonlocal handshake_found
+            try:
                 for line in iter(pipe.readline, ""):
                     if not line:
                         break
-                    self.after(0, lambda l=line.rstrip(): self.log(f"{name}: {l}"))
-                pipe.close()
-    
-            t_out = threading.Thread(target=stream, args=(proc.stdout, "OUT"))
-            t_err = threading.Thread(target=stream, args=(proc.stderr, "ERR"))
-            t_out.start()
-            t_err.start()
-    
-            proc.wait()
-            t_out.join()
-            t_err.join()
-    
-            # airodump-ng thường tự tạo file: <path>-01.cap
-            captured_file = path + "-01.cap"
-            if os.path.exists(captured_file):
-                self.last_capture_path = captured_file
-                self.log(f"Handshake capture saved to: {captured_file}")
-            else:
-                self.log("Capture file not found, maybe no handshake captured")
-    
-        except Exception as e:
-            self.log(f"Failed to run airodump-ng: {e}")
-    
-        # Quay về chế độ managed (tùy chọn)
+                    l = line.rstrip()
+                    self.after(0, lambda text=l, nm=name: self.log(f"{nm}: {text}"))
+                    low = l.lower()
+                    if "wpa handshake" in low:
+                        handshake_found = True
+                        self.after(0, lambda: self.log("Handshake detected in airodump output"))
+                        # signal to break reading loops
+                        try:
+                            proc.send_signal(signal.SIGINT)
+                        except Exception:
+                            try:
+                                proc.terminate()
+                            except:
+                                pass
+                        break
+            except Exception:
+                pass
+            finally:
+                try:
+                    pipe.close()
+                except:
+                    pass
+
+        t_out = threading.Thread(target=stream_reader, args=(proc.stdout, "OUT"), daemon=True)
+        t_err = threading.Thread(target=stream_reader, args=(proc.stderr, "ERR"), daemon=True)
+        t_out.start(); t_err.start()
+
+        # Wait until handshake or timeout
+        while True:
+            if handshake_found:
+                break
+            if proc.poll() is not None:
+                # process exited
+                break
+            if time.time() - start_time > timeout:
+                self.after(0, lambda: self.log(f"No handshake after {timeout}s, stopping capture"))
+                try:
+                    proc.send_signal(signal.SIGINT)
+                except Exception:
+                    try:
+                        proc.terminate()
+                    except:
+                        pass
+                break
+            time.sleep(0.5)
+
+        # ensure process stopped
         try:
-            subprocess.run(["sudo", "airmon-ng", "stop", monitor_iface], check=False)
-        except:
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.terminate()
+            except:
+                pass
+
+        # determine cap file
+        captured_file = f"{path_base}-01.cap"
+        if os.path.exists(captured_file) and handshake_found:
+            self.last_capture_path = captured_file
+            self.log(f"✅ Handshake capture saved to: {captured_file} (channel {channel})")
+        else:
+            # file may exist but no handshake
+            if os.path.exists(captured_file):
+                self.log(f"Capture file {captured_file} exists but no handshake was found")
+            else:
+                self.log("Capture file not found; no handshake captured")
+
+        # cleanup: try to stop monitor interface (optional)
+        try:
+            subprocess.run(["sudo", "airmon-ng", "stop", monitor_iface], check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        except Exception:
             pass
-        
+
         self.capture_btn.config(state=tk.NORMAL)
-    
+
+
 
     def start_crack(self):
         sel = self.net_listbox.curselection()
