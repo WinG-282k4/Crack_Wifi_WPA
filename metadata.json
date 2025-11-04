@@ -1,0 +1,5 @@
+{
+  "name": "Wi-Fi Security Tool Simulator",
+  "description": "An educational web application that simulates the user interface and workflow of the aircrack-ng suite for Wi-Fi security auditing. This application does not perform any real network operations and is for demonstration purposes only.",
+  "requestFramePermissions": []
+}

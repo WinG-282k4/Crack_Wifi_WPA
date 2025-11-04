@@ -1,0 +1,24 @@
+{
+  "name": "wi-fi-security-tool-simulator",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "start-server": "node server/server.js",
+    "dev:real": "cross-env VITE_USE_REAL=true VITE_COMMAND_SERVER_URL=http://localhost:4000 vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "typescript": "~5.8.2",
+    "vite": "^6.2.0",
+    "cross-env": "^7.0.3"
+  }
+}
