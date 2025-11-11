@@ -680,7 +680,7 @@ class DesktopApp(tk.Tk):
                     l = line.rstrip()
                     self.after(0, lambda text=l, nm=name: self.log(f"{nm}: {text}"))
                     low = l.lower()
-                    if "wpa handshake" in low:
+                    if "WPA handshake" in low:
                         handshake_found = True
                         self.after(0, lambda: self.log("Handshake detected in airodump output"))
                         try:
