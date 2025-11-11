@@ -563,7 +563,7 @@ class DesktopApp(tk.Tk):
         self.capturing = True
         self.stop_capture_event.clear()
         self._set_capture_mode(True)
-        self.log("Starting handshake capture (temporary files used; you will choose where to save after handshake)...")
+        self.log("Starting handshake capture (files will be saved under ./captures/ by default)...")
 
         try:
             entry = self.net_listbox.get(index)
@@ -616,11 +616,22 @@ class DesktopApp(tk.Tk):
 
         self.log(f"Monitor interface: {monitor_iface}")
 
-        # prepare temporary capture prefix
-        tmp = tempfile.mkdtemp(prefix="capture_")
-        prefix = os.path.join(tmp, "dump")
-        self.capture_tmpdir = tmp
-        self.capture_prefix = prefix
+        # prepare capture directory under current working directory
+        try:
+            cwd = os.getcwd()
+            captures_dir = os.path.join(cwd, "captures")
+            os.makedirs(captures_dir, exist_ok=True)
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            prefix = os.path.join(captures_dir, f"dump_{timestamp}")
+            self.capture_tmpdir = captures_dir
+            self.capture_prefix = prefix
+        except Exception as e:
+            self.log(f"Failed to prepare captures directory: {e}")
+            # fallback to tmp if needed
+            tmp = tempfile.mkdtemp(prefix="capture_")
+            prefix = os.path.join(tmp, "dump")
+            self.capture_tmpdir = tmp
+            self.capture_prefix = prefix
 
         cmd = ["sudo", "airodump-ng", "--bssid", bssid, "-c", str(channel), "-w", prefix, monitor_iface]
         self.log(f"Running: {' '.join(cmd)}")
@@ -727,17 +738,20 @@ class DesktopApp(tk.Tk):
         captured_file = f"{prefix}-01.cap"
 
         if os.path.exists(captured_file) and handshake_found:
-            # ask user where to save the final capture now
+            # ask user where to save the final capture now (default to captures dir)
             def ask_and_move():
                 default_name = f"handshake_{ssid.replace(' ', '_')}.cap"
+                default_dir = self.capture_tmpdir if self.capture_tmpdir else os.getcwd()
                 path = filedialog.asksaveasfilename(
                     title="Save handshake capture (final .cap)",
-                    defaultextension=".cap",
+                    initialdir=default_dir,
                     initialfile=default_name,
+                    defaultextension=".cap",
                     filetypes=[("Capture files", "*.cap"), ("All files", "*.*")]
                 )
                 if not path:
-                    self.log("User cancelled saving capture; temporary file left in: %s" % captured_file)
+                    # user cancelled: keep file in captures dir and inform path
+                    self.log(f"User cancelled saving capture; temporary file left in: {captured_file}")
                     self.last_capture_path = captured_file
                     return
                 try:
@@ -746,12 +760,12 @@ class DesktopApp(tk.Tk):
                     self.log(f"✅ Handshake capture saved to: {path} (channel {channel})")
                 except Exception as e:
                     self.log(f"Failed to move capture file: {e}")
+                    # keep original
                     self.last_capture_path = captured_file
             self.after(0, ask_and_move)
         else:
             if os.path.exists(captured_file):
                 self.log(f"Capture file {captured_file} exists but no handshake was found")
-                # optionally keep the file for later inspection
                 self.last_capture_path = captured_file
             else:
                 self.log("Capture file not found; no handshake captured")
@@ -784,16 +798,17 @@ class DesktopApp(tk.Tk):
     def _crack(self, index):
         self.crack_btn.config(state=tk.DISABLED)
         self.log("Starting cracking routine...")
+        overall_start = time.time()
 
         # try to see if aircrack-ng is available; if not simulate
         try:
-            proc = shutil.which("aircrack-ng")
+            proc_path = shutil.which("aircrack-ng")
         except Exception:
-            proc = None
+            proc_path = None
 
-        if proc:
+        if proc_path:
             self.log("aircrack-ng found, running real command (will prompt for .cap and wordlist if needed)")
-            self.log(f"aircrack-ng path: {proc}")
+            self.log(f"aircrack-ng path: {proc_path}")
 
             cap = self.last_capture_path
             if not cap or not os.path.exists(cap):
@@ -812,7 +827,7 @@ class DesktopApp(tk.Tk):
                     return
 
             try:
-                exe = proc
+                exe = proc_path
                 self.log(f"Running: {exe} -w {wordlist} {cap}")
                 p = subprocess.Popen([exe, "-w", wordlist, cap], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
@@ -828,23 +843,34 @@ class DesktopApp(tk.Tk):
                 t_out.start(); t_err.start()
                 code = p.wait()
                 t_out.join(timeout=0.1); t_err.join(timeout=0.1)
+                end_time = time.time()
+                elapsed = end_time - overall_start
                 self.log(f"aircrack-ng exited with code: {code}")
+                self.log(f"Crack finished in {elapsed:.2f}s")
+                messagebox.showinfo("Crack finished", f"aircrack-ng exited with code {code}\nTime: {elapsed:.2f}s")
             except Exception as e:
                 self.log(f"Failed to run aircrack-ng: {e}")
             time.sleep(0.2)
         else:
+            # simulated cracking but show progress + time and result in UI
             steps = 6
             for i in range(steps):
                 time.sleep(0.9)
-                self.log(f"Cracking... {int((i+1)/steps*100)}%")
+                pct = int((i+1)/steps*100)
+                self.log(f"Cracking... {pct}%")
+
+            end_time = time.time()
+            elapsed = end_time - overall_start
 
             if random.random() < 0.35:
                 key = "correcthorsebatterystaple"
                 self.log(f"Key found: {key}")
-                messagebox.showinfo("Crack result", f"Key found: {key}")
+                self.log(f"Crack finished in {elapsed:.2f}s")
+                messagebox.showinfo("Crack result", f"Key found: {key}\nTime: {elapsed:.2f}s")
             else:
                 self.log("Key not found (simulated)")
-                messagebox.showinfo("Crack result", "Key not found (simulated)")
+                self.log(f"Crack finished in {elapsed:.2f}s")
+                messagebox.showinfo("Crack result", f"Key not found (simulated)\nTime: {elapsed:.2f}s")
 
         self.crack_btn.config(state=tk.NORMAL)
 
@@ -854,7 +880,8 @@ class DesktopApp(tk.Tk):
             messagebox.showinfo("No output", "There is no terminal output to save.")
             return
         path = filedialog.asksaveasfilename(title="Save output", defaultextension=".txt",
-                                            filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+                                            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+                                            initialdir=os.getcwd())
         if not path:
             return
         with open(path, "w", encoding="utf-8") as f:
