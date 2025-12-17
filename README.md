@@ -1,90 +1,65 @@
-# wi-fi-security-tool-simulator — Run locally
+# Crack_Wifi_WPA
 
-This repository contains a browser UI (Vite + React) and a small local command server used to run a whitelist of wireless tools. The front-end is safe to run in a browser; the server exposes a limited, local API for invoking system commands (only on trusted machines).
+A practical desktop toolkit for scanning Wi‑Fi networks, capturing WPA/WPA2 handshakes, and attempting password cracking using wordlists. This repository focuses on a Python desktop app and helper scripts — there is no web app.
 
-## Run locally
+## Structure
 
-**Prerequisites:** Node.js (v16+ recommended)
+- `desktop_app/`
+  - Tkinter app (main entry: `tkinter_app copy.py`) and additional examples.
+  - Other files: `Crack_WPA.py`, `app(main).py`, `app_backup.py`, `README.md`, `requirements.txt`.
+- `tool/`
+  - Helper scripts and sample artifacts:
+    - `wpa_crack.py`, `wpa2_crack_main.py`, `wpa2_crack_multimain.py`, `wpa2_keys.py`
+    - Example outputs and captures: `cracked_wifi.txt`, `dump-01.cap`, `test.txt`
 
-1. Install dependencies:
+## Requirements
 
-```bash
-npm install
-```
+- Python 3.9+ (Tkinter included in standard Python).
+- Optional: PyQt5 if you plan to run the PyQt demo.
+- For real capture/crack (Linux recommended): `aircrack-ng` suite (`airmon-ng`, `airodump-ng`, `aireplay-ng`, `aircrack-ng`) available in PATH. Monitor mode and appropriate drivers are required.
 
-2. (Optional) Start the local command server. This server exposes a whitelist of system commands used for "real" wireless tooling. Only run this on a trusted machine.
-
-```bash
-# starts server at http://localhost:4000
-npm run start-server
-# On Linux you may need sudo to access wireless devices
-```
-
-3. Start the Vite dev server (open the app at http://localhost:5173):
-
-```bash
-npm run dev
-```
-
-4. Use the real command server from the front-end
-
-The repo includes a cross-platform script that sets the environment variables required for the front-end to talk to the command server:
-
-```bash
-npm run dev:real
-```
-
-If you prefer to set environment variables yourself, here are common ways to do that:
-
-- PowerShell (Windows):
+Install optional dependencies (PyQt5):
 
 ```powershell
-$env:VITE_COMMAND_SERVER_URL = 'http://localhost:4000'; npm run dev
+python -m pip install -r desktop_app/requirements.txt
 ```
 
-- cmd.exe (Windows):
+## Quick Start (Tkinter)
 
-```cmd
-set VITE_COMMAND_SERVER_URL=http://localhost:4000 && npm run dev
+Run the desktop app:
+
+```powershell
+python "desktop_app/tkinter_app copy.py"
 ```
 
-- macOS / Linux (bash/zsh):
+Behavior:
 
-```bash
-VITE_COMMAND_SERVER_URL=http://localhost:4000 npm run dev
+- On capture start, a per-network folder is created under `./captures/`:
+  - `capture_{SSID_sanitized}_{YYYYMMDD_HHMMSS}` (e.g., `capture_MyWifi_20251217_153012`)
+- `airodump-ng` writes files with the prefix `dump` (e.g., `dump-01.cap`) inside that folder.
+- After a "WPA handshake" is detected in process output, the app locates the capture file (retrying briefly) and sets `last_capture_path`. A Save‑As dialog appears (defaulting to the capture folder). If you cancel, the file remains in the folder.
+- Cracking uses `aircrack-ng` if present; otherwise the app simulates. The final result and elapsed time are shown.
+
+See details in [desktop_app/README.md](desktop_app/README.md).
+
+## Tool Scripts
+
+The `tool/` folder contains example scripts and artifacts for WPA/WPA2 cracking workflows. These are provided as references and may require adaptation for your environment.
+
+Typical usage patterns (adjust as needed):
+
+```powershell
+# Explore script usage (if implemented)
+python tool/wpa_crack.py --help
+
+# Example: run a cracker with a capture and wordlist (script-specific)
+python tool/wpa_crack.py .\tool\dump-01.cap .\wordlists\rockyou.txt
 ```
 
-Prefer `npm run dev:real` on Windows to avoid shell-specific environment syntax; that script uses `cross-env` for cross-platform behavior.
+If a script does not implement `--help`, open the file to review expected arguments and flow. Some scripts may be prototypes (e.g., multi-main variants) and require editing.
 
-## Running on Kali Linux (real wireless tools)
+## Notes
 
-On Kali you can use the server to run actual wireless tools (airmon-ng, airodump-ng, aireplay-ng, aircrack-ng, iwlist, iwconfig, etc.). Steps are the same as above, but you will typically run the server with elevated privileges to access wireless interfaces:
-
-1. Install dependencies:
-
-```bash
-npm install
-```
-
-2. Start the command server (may need sudo):
-
-```bash
-sudo npm run start-server
-```
-
-3. In a separate terminal, start the front-end. Use the cross-platform script or set env vars directly:
-
-```bash
-npm run dev:real
-# or, if you prefer manual env vars:
-VITE_COMMAND_SERVER_URL=http://localhost:4000 npm run dev
-```
-
-4. Open the app at http://localhost:5173 (or the URL Vite prints).
-
-### Notes
-
-- The command server listens by default on port 4000. If you change that port, update `VITE_COMMAND_SERVER_URL` accordingly.
-- `npm run dev:real` uses `cross-env` to set `VITE_USE_REAL=true` and `VITE_COMMAND_SERVER_URL` in a cross-platform way.
-
-Security note: The server enforces a strict command whitelist. Do not expose the server to untrusted networks. Only run the server on machines you control and trust.
+- Real wireless operations often require elevated privileges and appropriate wireless hardware/driver support, especially for monitor mode and injection.
+- On Windows, consider using WSL or a Linux VM if you need the full `aircrack-ng` toolchain.
+- Always use these tools responsibly and only on networks you have permission to test.
